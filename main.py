@@ -118,6 +118,7 @@ def main():
     parser.add_argument('--friendly_loss', type=str, help='loss to use for friendly noise', default='KL', choices=['MSE', 'KL'])
     parser.add_argument('--save_friendly_noise', action='store_true', help='save friendly noise')
     parser.add_argument('--load_friendly_noise', type=str, help='load friendly noise', default=None)
+    parser.add_argument('--friendly_regenerate_every_epoch', action='store_true', help='regenerate friendly noise every epoch instead of once (baseline: generate once at friendly_begin_epoch)')
 
 
 
@@ -206,6 +207,7 @@ def main():
     dir_name += f'-_{args.friendly_mu}' if 'friendly' in args.noise_type else ''
     dir_name += f'-_clp{args.friendly_clamp}' if 'friendly' in args.noise_type else ''
     dir_name += f'-_loss-{args.friendly_loss}' if 'friendly' in args.noise_type else ''
+    dir_name += f'-regen' if args.friendly_regenerate_every_epoch and 'friendly' in args.noise_type else ''
     args.out = os.path.join(args.out, dir_name)
 
 
@@ -392,7 +394,7 @@ def main():
     if args.load_friendly_noise:
         logger.info(f"Loading friendly noise from {args.load_friendly_noise}...")
         perturbs = np.load(args.load_friendly_noise)
-        train_loader.dataset.set_perturbations(torch.Tensor(friendly))
+        train_loader.dataset.set_perturbations(torch.Tensor(perturbs))
         logger.info(f"Friendly noise loaded!")
 
 
@@ -439,8 +441,19 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             p_bar = tqdm(range(args.eval_step))
         model.train()
 
-        if 'friendly' in args.noise_type and epoch == args.friendly_begin_epoch:
-            logger.info(f"Generating friendly noise: epochs={args.friendly_epochs}  mu={args.friendly_mu} lr={args.friendly_lr} loss={args.friendly_loss}")
+        # Generate friendly noise: either once at begin_epoch (baseline) or every epoch (new approach)
+        should_generate_friendly = False
+        if 'friendly' in args.noise_type:
+            if args.friendly_regenerate_every_epoch:
+                # Regenerate every epoch starting from friendly_begin_epoch
+                should_generate_friendly = (epoch >= args.friendly_begin_epoch)
+            else:
+                # Baseline: generate once at friendly_begin_epoch
+                should_generate_friendly = (epoch == args.friendly_begin_epoch)
+        
+        if should_generate_friendly:
+            regen_msg = f" (regenerating every epoch)" if args.friendly_regenerate_every_epoch else ""
+            logger.info(f"Generating friendly noise at epoch {epoch}{regen_msg}: epochs={args.friendly_epochs}  mu={args.friendly_mu} lr={args.friendly_lr} loss={args.friendly_loss}")
             out = generate_friendly_noise(
                 model,
                 noaug_trainloader,
@@ -450,12 +463,12 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
                 friendly_lr=args.friendly_lr,
                 clamp_min=-args.friendly_clamp / 255,
                 clamp_max=args.friendly_clamp / 255,
-                return_preds=args.save_friendly_noise,
+                return_preds=args.save_friendly_noise and epoch == args.friendly_begin_epoch,  # Only save on first generation
                 loss_fn=args.friendly_loss)
             model.zero_grad()
             model.train()
 
-            if args.save_friendly_noise:
+            if args.save_friendly_noise and epoch == args.friendly_begin_epoch:
                 friendly_noise, original_preds = out
                 model_to_save = model.module if hasattr(model, "module") else model
                 save_checkpoint({
