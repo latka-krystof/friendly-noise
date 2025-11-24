@@ -112,6 +112,7 @@ def main():
 
     parser.add_argument('--friendly_begin_epoch', type=int, help='epoch to start adding friendly noise', default=0)
     parser.add_argument('--friendly_epochs', type=int, help='number of epochs to run friendly noise generation for', default=30)
+    parser.add_argument('--friendly_epochs_regen', type=int, help='number of epochs for friendly noise when regenerating every epoch (default: same as friendly_epochs)', default=None)
     parser.add_argument('--friendly_lr', type=float, help='learning rate for friendly noise generation', default=100)
     parser.add_argument('--friendly_mu', type=float, help='weight of magnitude constraint term in friendly noise loss', default=1)
     parser.add_argument('--friendly_clamp', type=float, help='how much to clamp generated friendly noise', default=16)
@@ -119,6 +120,7 @@ def main():
     parser.add_argument('--save_friendly_noise', action='store_true', help='save friendly noise')
     parser.add_argument('--load_friendly_noise', type=str, help='load friendly noise', default=None)
     parser.add_argument('--friendly_regenerate_every_epoch', action='store_true', help='regenerate friendly noise every epoch instead of once (baseline: generate once at friendly_begin_epoch)')
+    parser.add_argument('--friendly_regenerate_interval', type=int, help='regenerate friendly noise every N epochs (overrides --friendly_regenerate_every_epoch if set). Default: None (generate once)', default=None)
 
 
 
@@ -207,7 +209,11 @@ def main():
     dir_name += f'-_{args.friendly_mu}' if 'friendly' in args.noise_type else ''
     dir_name += f'-_clp{args.friendly_clamp}' if 'friendly' in args.noise_type else ''
     dir_name += f'-_loss-{args.friendly_loss}' if 'friendly' in args.noise_type else ''
-    dir_name += f'-regen' if args.friendly_regenerate_every_epoch and 'friendly' in args.noise_type else ''
+    if 'friendly' in args.noise_type:
+        if args.friendly_regenerate_interval is not None:
+            dir_name += f'-regen-int{args.friendly_regenerate_interval}'
+        elif args.friendly_regenerate_every_epoch:
+            dir_name += f'-regen'
     args.out = os.path.join(args.out, dir_name)
 
 
@@ -441,10 +447,15 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             p_bar = tqdm(range(args.eval_step))
         model.train()
 
-        # Generate friendly noise: either once at begin_epoch (baseline) or every epoch (new approach)
+        # Generate friendly noise: once, every epoch, or at intervals
         should_generate_friendly = False
         if 'friendly' in args.noise_type:
-            if args.friendly_regenerate_every_epoch:
+            if args.friendly_regenerate_interval is not None:
+                # Regenerate at intervals (e.g., every 5 epochs) starting from friendly_begin_epoch
+                epochs_since_begin = epoch - args.friendly_begin_epoch
+                should_generate_friendly = (epoch >= args.friendly_begin_epoch and 
+                                          epochs_since_begin % args.friendly_regenerate_interval == 0)
+            elif args.friendly_regenerate_every_epoch:
                 # Regenerate every epoch starting from friendly_begin_epoch
                 should_generate_friendly = (epoch >= args.friendly_begin_epoch)
             else:
@@ -452,13 +463,34 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
                 should_generate_friendly = (epoch == args.friendly_begin_epoch)
         
         if should_generate_friendly:
-            regen_msg = f" (regenerating every epoch)" if args.friendly_regenerate_every_epoch else ""
-            logger.info(f"Generating friendly noise at epoch {epoch}{regen_msg}: epochs={args.friendly_epochs}  mu={args.friendly_mu} lr={args.friendly_lr} loss={args.friendly_loss}")
+            # Determine if we're regenerating (not just first generation)
+            is_regenerating = (args.friendly_regenerate_every_epoch or 
+                             (args.friendly_regenerate_interval is not None and epoch > args.friendly_begin_epoch))
+            
+            # Clear GPU cache before regenerating to prevent OOM
+            if is_regenerating:
+                torch.cuda.empty_cache()
+                # Delete old friendly noise if it exists
+                if hasattr(trainloader.dataset, 'perturbations') and trainloader.dataset.perturbations is not None:
+                    del trainloader.dataset.perturbations
+                    trainloader.dataset.perturbations = None
+            
+            # Build regeneration message
+            if args.friendly_regenerate_interval is not None:
+                regen_msg = f" (regenerating every {args.friendly_regenerate_interval} epochs)"
+            elif args.friendly_regenerate_every_epoch:
+                regen_msg = f" (regenerating every epoch)"
+            else:
+                regen_msg = ""
+            
+            # Use reduced epochs when regenerating to save time and memory
+            friendly_epochs_to_use = args.friendly_epochs_regen if (is_regenerating and args.friendly_epochs_regen is not None) else args.friendly_epochs
+            logger.info(f"Generating friendly noise at epoch {epoch}{regen_msg}: epochs={friendly_epochs_to_use}  mu={args.friendly_mu} lr={args.friendly_lr} loss={args.friendly_loss}")
             out = generate_friendly_noise(
                 model,
                 noaug_trainloader,
                 args.device,
-                friendly_epochs=args.friendly_epochs,
+                friendly_epochs=friendly_epochs_to_use,
                 mu=args.friendly_mu,
                 friendly_lr=args.friendly_lr,
                 clamp_min=-args.friendly_clamp / 255,
@@ -467,6 +499,10 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
                 loss_fn=args.friendly_loss)
             model.zero_grad()
             model.train()
+            
+            # Clear cache after generation if regenerating
+            if is_regenerating:
+                torch.cuda.empty_cache()
 
             if args.save_friendly_noise and epoch == args.friendly_begin_epoch:
                 friendly_noise, original_preds = out

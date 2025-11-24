@@ -40,6 +40,9 @@ def generate_friendly_noise(
         init = (torch.rand(*(inputs.shape)) - 0.5) * 2 * 8/255
         eps = torch.autograd.Variable(init.to(device), requires_grad=True)
         optimizer = torch.optim.SGD([eps], lr=friendly_lr, momentum=friendly_momentum, nesterov=nesterov)
+        
+        # Clear any previous optimizer state to save memory
+        optimizer.zero_grad(set_to_none=True)
 
         if friendly_steps is None:
             friendly_steps = [friendly_epochs // 2, friendly_epochs // 4 * 3]
@@ -78,6 +81,12 @@ def generate_friendly_noise(
         friendly_noise[idx] = eps.cpu().detach()
         if return_preds:
            preds[idx] = output_original.cpu()
+        
+        # Clean up batch-level tensors to free GPU memory
+        del eps, optimizer, scheduler
+        del inputs, init, images_normalized, output_original
+        torch.cuda.empty_cache()
+    
     friendly_noise = torch.clamp(friendly_noise, clamp_min, clamp_max)
 
     trainloader.dataset.transform = transform
