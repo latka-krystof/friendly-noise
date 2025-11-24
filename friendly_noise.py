@@ -77,6 +77,9 @@ def generate_friendly_noise(
                   f"Mean (abs): {torch.abs(eps).mean():.5f}  Mean: {torch.mean(eps):.5f}  "
                   f"Mean (abs) Clamp: {torch.abs(eps_clamp).mean():.5f}  Mean Clamp: {torch.mean(eps_clamp):.5f}  "
                   f"emp_risk: {emp_risk:.3f}  constraint: {constraint:.3f}", end='\r', flush=True)
+            
+            # Clean up intermediate tensors from this iteration
+            del perturbed, perturbed_normalized, output_perturb, eps_clamp, emp_risk, constraint, loss
 
         friendly_noise[idx] = eps.cpu().detach()
         if return_preds:
@@ -85,8 +88,13 @@ def generate_friendly_noise(
         # Clean up batch-level tensors to free GPU memory
         del eps, optimizer, scheduler
         del inputs, init, images_normalized, output_original
-        torch.cuda.empty_cache()
+        
+        # Periodically clear cache every 10 batches to prevent accumulation
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
     
+    # Final cleanup
+    torch.cuda.empty_cache()
     friendly_noise = torch.clamp(friendly_noise, clamp_min, clamp_max)
 
     trainloader.dataset.transform = transform

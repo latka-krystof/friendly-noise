@@ -469,11 +469,20 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             
             # Clear GPU cache before regenerating to prevent OOM
             if is_regenerating:
-                torch.cuda.empty_cache()
-                # Delete old friendly noise if it exists
+                # Force cleanup of old friendly noise
                 if hasattr(trainloader.dataset, 'perturbations') and trainloader.dataset.perturbations is not None:
-                    del trainloader.dataset.perturbations
+                    old_perturbations = trainloader.dataset.perturbations
+                    # If it's a tensor, move to CPU and delete
+                    if isinstance(old_perturbations, torch.Tensor):
+                        if old_perturbations.is_cuda:
+                            old_perturbations = old_perturbations.cpu()
+                    del old_perturbations
                     trainloader.dataset.perturbations = None
+                # Force garbage collection
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Wait for all operations to complete
             
             # Build regeneration message
             if args.friendly_regenerate_interval is not None:
@@ -502,7 +511,10 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             
             # Clear cache after generation if regenerating
             if is_regenerating:
+                import gc
+                gc.collect()
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
             if args.save_friendly_noise and epoch == args.friendly_begin_epoch:
                 friendly_noise, original_preds = out
