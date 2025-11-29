@@ -111,6 +111,102 @@ def friendly_loss(output, target, eps, criterion):
     return emp_risk, constraint
 
 
+def generator_loss(model, generator, inputs_normalized, targets, criterion, lambda_mag, device):
+    """
+    Compute loss for training the noise generator.
+    
+    The generator loss aims to:
+    1. Minimize the difference between model predictions on clean vs noisy inputs
+    2. Encourage non-zero noise through a negative magnitude constraint
+    
+    Args:
+        model: The classifier model (frozen during generator training)
+        generator: The noise generator network
+        inputs_normalized: Already-transformed input images (normalized + augmented from dataloader)
+        targets: True labels
+        criterion: Loss function (e.g., KLDivLoss or MSELoss)
+        lambda_mag: Weight for the negative magnitude constraint term
+        device: Device to run computations on
+        
+    Returns:
+        loss: Total generator loss
+        emp_risk: Empirical risk component
+        constraint: Magnitude constraint component
+    """
+    model.eval()  # Ensure model is in eval mode
+    generator.train()
+    
+    # Inputs are already normalized and augmented from the dataloader
+    inputs_normalized = inputs_normalized.to(device)
+    
+    # Get original model output (detached)
+    with torch.no_grad():
+        output_original = model(inputs_normalized)
+        if isinstance(criterion, torch.nn.KLDivLoss):
+            output_original = F.log_softmax(output_original, dim=1).detach()
+        else:
+            output_original = output_original.detach()
+    
+    # Generate noise from generator (pass normalized inputs)
+    noise = generator(inputs_normalized)
+    
+    # Apply noise to normalized inputs
+    inputs_noisy = torch.clamp(inputs_normalized + noise, -3, 3)  # Reasonable bounds for normalized images
+    
+    # Get model output on noisy inputs
+    output_noisy = model(inputs_noisy)
+    if isinstance(criterion, torch.nn.KLDivLoss):
+        output_noisy = F.log_softmax(output_noisy, dim=1)
+    
+    # Compute empirical risk (difference between clean and noisy predictions)
+    emp_risk = criterion(output_noisy, output_original)
+    
+    # Compute magnitude constraint (negative to encourage non-zero noise)
+    magnitude = torch.mean(torch.square(noise))
+    
+    # Total loss: empirical risk - lambda * magnitude
+    loss = emp_risk - lambda_mag * magnitude
+    
+    return loss, emp_risk, magnitude
+
+
+def model_loss_with_generator(model, generator, inputs_normalized, targets, loss_fn, device):
+    """
+    Compute loss for training the model with generated noise.
+    
+    The model is trained ONLY on noisy inputs to be robust to the generated noise.
+    
+    Args:
+        model: The classifier model
+        generator: The noise generator network (frozen during model training)
+        inputs_normalized: Already-transformed input images (normalized + augmented from dataloader)
+        targets: True labels
+        loss_fn: Loss function (e.g., CrossEntropyLoss)
+        device: Device to run computations on
+        
+    Returns:
+        loss: Model loss on noisy inputs only
+    """
+    model.train()
+    generator.eval()  # Ensure generator is in eval mode
+    
+    # Inputs are already normalized and augmented from the dataloader
+    inputs_normalized = inputs_normalized.to(device)
+    
+    # Generate noise (no gradients through generator)
+    with torch.no_grad():
+        noise = generator(inputs_normalized)
+    
+    # Apply noise to normalized inputs
+    inputs_noisy = torch.clamp(inputs_normalized + noise, -3, 3)
+    
+    # Loss on noisy inputs only
+    output_noisy = model(inputs_noisy)
+    loss = loss_fn(output_noisy, targets.to(device)).mean()
+    
+    return loss
+
+
 class UniformNoise(object):
     def __init__(self, eps):
         self.eps = eps

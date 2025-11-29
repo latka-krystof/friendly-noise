@@ -21,6 +21,7 @@ from utils import AverageMeter, accuracy
 from models.resnet import resnet_picker
 from models.alexnet import AlexNet
 from models.lenet import LeNet
+from models.noise_generator import generator_picker
 
 import pickle
 from torchvision import datasets
@@ -34,6 +35,7 @@ from utils.misc import GradualWarmupScheduler
 
 from diff_data_augmentation import RandomTransform
 from friendly_noise import generate_friendly_noise, UniformNoise, GaussianNoise, BernoulliNoise
+from friendly_noise import generator_loss, model_loss_with_generator
 
 import pandas as pd
 
@@ -122,6 +124,14 @@ def main():
     parser.add_argument('--friendly_regenerate_every_epoch', action='store_true', help='regenerate friendly noise every epoch instead of once (baseline: generate once at friendly_begin_epoch)')
     parser.add_argument('--friendly_regenerate_interval', type=int, help='regenerate friendly noise every N epochs (overrides --friendly_regenerate_every_epoch if set). Default: None (generate once)', default=None)
 
+    # Noise Generator Arguments
+    parser.add_argument('--use_generator', action='store_true', help='use noise generator network instead of optimizing noise directly')
+    parser.add_argument('--generator_arch', type=str, default='simple', choices=['simple', 'encoder-decoder'], help='architecture for noise generator')
+    parser.add_argument('--generator_begin_epoch', type=int, default=0, help='epoch to start training the noise generator')
+    parser.add_argument('--generator_schedule', type=str, default='1,1', help='alternating training schedule as "gen_epochs,model_epochs" (e.g., "5,1" means train generator for 5 epochs then model for 1)')
+    parser.add_argument('--generator_lr', type=float, default=0.001, help='learning rate for the noise generator')
+    parser.add_argument('--generator_lambda', type=float, default=1.0, help='weight for the negative magnitude constraint term in generator loss')
+    parser.add_argument('--generator_weight_decay', type=float, default=1e-4, help='weight decay for generator optimizer')
 
 
     args = parser.parse_args()
@@ -177,10 +187,16 @@ def main():
             sum(p.numel() for p in model.parameters())/1e6))
         return model
 
-    device = torch.device('cuda', args.gpu_id)
+    # Support CPU and CUDA
+    if torch.cuda.is_available():
+        device = torch.device('cuda', args.gpu_id)
+        args.n_gpu = torch.cuda.device_count()
+    else:
+        device = torch.device('cpu')
+        args.n_gpu = 0
+        logger.warning("CUDA not available, using CPU")
+    
     args.world_size = 1
-    args.n_gpu = torch.cuda.device_count()
-
     args.device = device
 
     if args.seed is not None:
@@ -214,6 +230,16 @@ def main():
             dir_name += f'-regen-int{args.friendly_regenerate_interval}'
         elif args.friendly_regenerate_every_epoch:
             dir_name += f'-regen'
+    
+    # Add generator parameters to directory name
+    if args.use_generator:
+        dir_name += f'-gen'
+        dir_name += f'-{args.generator_arch}'
+        dir_name += f'-begin{args.generator_begin_epoch}'
+        dir_name += f'-sched{args.generator_schedule}'
+        dir_name += f'-lr{args.generator_lr}'
+        dir_name += f'-lam{args.generator_lambda}'
+    
     args.out = os.path.join(args.out, dir_name)
 
 
@@ -383,6 +409,47 @@ def main():
 
     loss_fn = nn.CrossEntropyLoss(reduction='none')
 
+    # Initialize noise generator if requested
+    generator = None
+    generator_optimizer = None
+    generator_scheduler = None
+    
+    if args.use_generator:
+        logger.info("***** Initializing Noise Generator *****")
+        logger.info(f"  Generator architecture: {args.generator_arch}")
+        logger.info(f"  Generator begins at epoch: {args.generator_begin_epoch}")
+        logger.info(f"  Generator schedule: {args.generator_schedule}")
+        logger.info(f"  Generator learning rate: {args.generator_lr}")
+        logger.info(f"  Generator lambda (magnitude weight): {args.generator_lambda}")
+        
+        # Determine input channels based on dataset
+        in_channels = 3  # RGB for CIFAR-10 and TinyImageNet
+        
+        # Create generator
+        generator = generator_picker(
+            arch=args.generator_arch,
+            in_channels=in_channels,
+            noise_clamp=args.friendly_clamp / 255 if hasattr(args, 'friendly_clamp') else 32 / 255
+        )
+        generator.to(args.device)
+        
+        logger.info("Total generator params: {:.2f}M".format(
+            sum(p.numel() for p in generator.parameters())/1e6))
+        
+        # Create generator optimizer
+        generator_optimizer = optim.Adam(
+            generator.parameters(),
+            lr=args.generator_lr,
+            weight_decay=args.generator_weight_decay
+        )
+        
+        # Create generator scheduler (simpler schedule than model)
+        generator_scheduler = torch.optim.lr_scheduler.StepLR(
+            generator_optimizer,
+            step_size=max(1, args.epochs // 3),
+            gamma=0.5
+        )
+
     args.start_epoch = 0
 
     if args.resume and (args.scenario == 'scratch'):
@@ -396,6 +463,16 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # Load generator state if available
+        if args.use_generator and generator is not None:
+            if 'generator_state_dict' in checkpoint:
+                logger.info("==> Loading generator state from checkpoint")
+                generator.load_state_dict(checkpoint['generator_state_dict'])
+            if 'generator_optimizer' in checkpoint and generator_optimizer is not None:
+                generator_optimizer.load_state_dict(checkpoint['generator_optimizer'])
+            if 'generator_scheduler' in checkpoint and generator_scheduler is not None:
+                generator_scheduler.load_state_dict(checkpoint['generator_scheduler'])
 
     if args.load_friendly_noise:
         logger.info(f"Loading friendly noise from {args.load_friendly_noise}...")
@@ -412,18 +489,28 @@ def main():
 
     model.zero_grad()
     model_to_save = model.module if hasattr(model, "module") else model
-    save_checkpoint({
+    init_checkpoint = {
         'epoch': 0,
         'state_dict': model_to_save.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
-    }, is_best=False, checkpoint=args.out, filename='init.pth.tar')
+    }
+    
+    if args.use_generator and generator is not None:
+        generator_to_save = generator.module if hasattr(generator, "module") else generator
+        init_checkpoint['generator_state_dict'] = generator_to_save.state_dict()
+        if generator_optimizer is not None:
+            init_checkpoint['generator_optimizer'] = generator_optimizer.state_dict()
+        if generator_scheduler is not None:
+            init_checkpoint['generator_scheduler'] = generator_scheduler.state_dict()
+    
+    save_checkpoint(init_checkpoint, is_best=False, checkpoint=args.out, filename='init.pth.tar')
 
 
-    train(args, train_loader, noaug_train_loader, test_loader, model, optimizer, lr_scheduler_f, target_img, target_class, poisoned_label, train_dataset, loss_fn, poison_indices, base_dataset, poison_tuples)
+    train(args, train_loader, noaug_train_loader, test_loader, model, optimizer, lr_scheduler_f, target_img, target_class, poisoned_label, train_dataset, loss_fn, poison_indices, base_dataset, poison_tuples, generator, generator_optimizer, generator_scheduler)
 
-def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, scheduler, target_img, target_class, poisoned_label, train_dataset, loss_fn, poison_indices, base_dataset, poison_tuples):
-    global best_acc
+def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, scheduler, target_img, target_class, poisoned_label, train_dataset, loss_fn, poison_indices, base_dataset, poison_tuples, generator=None, generator_optimizer=None, generator_scheduler=None):
+    global best_acc, transform_train
     test_accs = []
     poison_accs = []
     cluster = []
@@ -434,6 +521,13 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
     N = args.train_size
     weights = torch.ones(N)
     times_selected = torch.zeros(N)
+    
+    # Parse generator training schedule
+    if args.use_generator and generator is not None:
+        gen_epochs, model_epochs = map(int, args.generator_schedule.split(','))
+        logger.info(f"Generator training schedule: {gen_epochs} generator epochs, {model_epochs} model epochs")
+    else:
+        gen_epochs, model_epochs = 0, 1
 
     for epoch in range(args.start_epoch, args.epochs):
         logger.info(f"***** Epoch {epoch} *****")
@@ -542,26 +636,104 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             trainloader.dataset.set_perturbations(friendly_noise)
             logger.info(f"Friendly noise stats:  Max: {torch.max(friendly_noise)}  Min: {torch.min(friendly_noise)}  Mean (abs): {torch.mean(torch.abs(friendly_noise))}  Mean: {torch.mean(friendly_noise)}")
 
+        # Determine training mode for generator-based training
+        train_generator_mode = False
+        train_model_mode = True
+        
+        if args.use_generator and generator is not None and epoch >= args.generator_begin_epoch:
+            # Calculate position in alternating schedule
+            epochs_since_begin = epoch - args.generator_begin_epoch
+            cycle_length = gen_epochs + model_epochs
+            position_in_cycle = epochs_since_begin % cycle_length
+            
+            if position_in_cycle < gen_epochs:
+                # Train generator, freeze model
+                train_generator_mode = True
+                train_model_mode = False
+                logger.info(f"Epoch {epoch}: Training GENERATOR (position {position_in_cycle}/{gen_epochs} in generator phase)")
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad = False
+                generator.train()
+                for param in generator.parameters():
+                    param.requires_grad = True
+            else:
+                # Train model, freeze generator
+                train_generator_mode = False
+                train_model_mode = True
+                logger.info(f"Epoch {epoch}: Training MODEL (position {position_in_cycle - gen_epochs}/{model_epochs} in model phase)")
+                model.train()
+                for param in model.parameters():
+                    param.requires_grad = True
+                generator.eval()
+                for param in generator.parameters():
+                    param.requires_grad = False
+
         for batch_idx, batch_input in enumerate(trainloader):
             input, targets_u_gt, p, index = batch_input
             targets_u_gt = targets_u_gt.long()
             num_poison_selected += torch.sum(p)
 
             data_time.update(time.time() - end)
-            logits_u_w = model(input.to(args.device))
-            pseudo_label = torch.softmax(logits_u_w, dim=-1)
-            probs_u, targets_u = torch.sort(pseudo_label, dim=-1, descending=True)
-            max_probs, targets_u = probs_u[:, 0], targets_u[:, 0]
+            
+            if train_generator_mode:
+                # Train the generator
+                # Use KLDivLoss for generator training to match friendly noise approach
+                if args.friendly_loss == 'KL':
+                    gen_criterion = torch.nn.KLDivLoss(reduction='batchmean', log_target=True)
+                else:
+                    gen_criterion = torch.nn.MSELoss()
+                
+                loss, emp_risk, magnitude = generator_loss(
+                    model=model,
+                    generator=generator,
+                    inputs_normalized=input,
+                    targets=targets_u_gt,
+                    criterion=gen_criterion,
+                    lambda_mag=args.generator_lambda,
+                    device=args.device
+                )
+                
+                generator_optimizer.zero_grad()
+                loss.backward()
+                generator_optimizer.step()
+                generator.zero_grad()
+                
+                losses.update(loss.item())
+                
+            elif train_model_mode and args.use_generator and generator is not None and epoch >= args.generator_begin_epoch:
+                # Train the model with generated noise (only on noisy inputs)
+                loss = model_loss_with_generator(
+                    model=model,
+                    generator=generator,
+                    inputs_normalized=input,
+                    targets=targets_u_gt,
+                    loss_fn=loss_fn,
+                    device=args.device
+                )
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                model.zero_grad()
+                
+                losses.update(loss.item())
+                
+            else:
+                # Standard training (no generator)
+                logits_u_w = model(input.to(args.device))
+                pseudo_label = torch.softmax(logits_u_w, dim=-1)
+                probs_u, targets_u = torch.sort(pseudo_label, dim=-1, descending=True)
+                max_probs, targets_u = probs_u[:, 0], targets_u[:, 0]
 
+                loss = loss_fn(logits_u_w, targets_u_gt.to(args.device))
+                loss = loss.mean()
 
-            loss = loss_fn(logits_u_w, targets_u_gt.to(args.device))
-            loss = loss.mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            losses.update(loss.item())
-            optimizer.step()
-            model.zero_grad()
+                optimizer.zero_grad()
+                loss.backward()
+                losses.update(loss.item())
+                optimizer.step()
+                model.zero_grad()
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -583,7 +755,11 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
         if not args.no_progress:
             p_bar.close()
 
-        scheduler.step()
+        # Step the appropriate scheduler
+        if train_generator_mode and generator_scheduler is not None:
+            generator_scheduler.step()
+        else:
+            scheduler.step()
 
         if epoch % args.val_freq != 0 and epoch != args.epochs - 1:
             continue
@@ -626,7 +802,7 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             best_p_acc = p_acc
 
         model_to_save = model.module if hasattr(model, "module") else model
-        save_checkpoint({
+        checkpoint_dict = {
             'epoch': epoch + 1,
             'state_dict': model_to_save.state_dict(),
             'acc': test_acc,
@@ -636,7 +812,18 @@ def train(args, trainloader, noaug_trainloader, test_loader, model, optimizer, s
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'times_selected': times_selected,
-        }, is_best, args.out)
+        }
+        
+        # Add generator state if using generator
+        if args.use_generator and generator is not None:
+            generator_to_save = generator.module if hasattr(generator, "module") else generator
+            checkpoint_dict['generator_state_dict'] = generator_to_save.state_dict()
+            if generator_optimizer is not None:
+                checkpoint_dict['generator_optimizer'] = generator_optimizer.state_dict()
+            if generator_scheduler is not None:
+                checkpoint_dict['generator_scheduler'] = generator_scheduler.state_dict()
+        
+        save_checkpoint(checkpoint_dict, is_best, args.out)
 
         test_accs.append(test_acc)
         poison_accs.append(p_acc)
